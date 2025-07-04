@@ -1,19 +1,27 @@
 import os
 import re
+import tempfile
 import PyPDF2
 import pandas as pd
 import streamlit as st
 from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor
 
-def extract_text_from_pdf(pdf_file):
-    """Extract text content from a PDF file"""
+# Configuration
+MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024  # 10GB
+MAX_WORKERS = 4  # Number of parallel processes
+CHUNK_SIZE = 50  # Number of files to process at once
+
+def extract_text_from_pdf(pdf_path):
+    """Extract text content from a PDF file with error handling"""
     text = ""
     try:
-        reader = PyPDF2.PdfReader(pdf_file)
-        for page in reader.pages:
-            text += page.extract_text()
+        with open(pdf_path, 'rb') as file:
+            reader = PyPDF2.PdfReader(file)
+            for page in reader.pages:
+                text += page.extract_text() or ""  # Handle None returns
     except Exception as e:
-        st.error(f"Error reading PDF: {str(e)}")
+        st.error(f"Error reading {os.path.basename(pdf_path)}: {str(e)}")
     return text
 
 def extract_contact_info(text, filename):
@@ -26,108 +34,125 @@ def extract_contact_info(text, filename):
     phone = re.findall(r'[\+\(]?[1-9][0-9 .\-\(\)]{8,}[0-9]', text)
     phone = phone[0] if phone else ""
     
-    # Extract name - improved approach
+    # Extract name - first non-empty line without special chars
     name = ""
     lines = [line.strip() for line in text.split('\n') if line.strip()]
-    
     if lines:
-        potential_names = []
         for line in lines:
-            if not any(char.isdigit() for char in line) and \
-               '@' not in line and \
-               'http' not in line.lower() and \
-               len(line.split()) >= 1 and len(line.split()) <= 4:
-                potential_names.append(line)
-        
-        if potential_names:
-            name = potential_names[0]
-            name = re.sub(r'^(Mr\.?|Mrs\.?|Ms\.?|Dr\.?|Prof\.?)\s*', '', name, flags=re.IGNORECASE)
-            name = name.strip()
+            if (not any(char.isdigit() for char in line) and 
+                '@' not in line and 
+                'http' not in line.lower() and 
+                len(line.split()) <= 4):
+                name = line.strip()
+                break
     
-    # Extract years of experience
-    experience = "N/A"
-    exp_patterns = [
-        r'(\d+)\+?\s*(years?|yrs?)\s*(of)?\s*(experience|exp)',
-        r'experience\s*:\s*(\d+)\s*(years?|yrs?)',
-        r'(\d+)\s*-\s*(\d+)\s*years?\s*experience'
-    ]
-    for pattern in exp_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            experience = match.group(1) if match.group(1) else "1"
-            break
-    
-    # Extract location (only specific Indian cities)
+    # Extract location (specific Indian cities)
     location = ""
-    indian_cities = ['hyderabad', 'chennai', 'bangalore', 'pune', 'mumbai', 'delhi', 
-                    'gurgaon', 'noida', 'kolkata', 'ahmedabad']
-    location_pattern = r'\b(' + '|'.join(indian_cities) + r')\b'
-    match = re.search(location_pattern, text, re.IGNORECASE)
+    indian_cities = ['hyderabad', 'chennai', 'bangalore', 'pune', 'mumbai', 
+                    'delhi', 'gurgaon', 'noida', 'kolkata', 'ahmedabad']
+    match = re.search(r'\b(' + '|'.join(indian_cities) + r')\b', text, re.IGNORECASE)
     if match:
-        location = match.group(0).title()  # Capitalize first letter
+        location = match.group(0).title()
     
     return {
         'Name': name,
         'Phone': phone,
         'Email': email,
-        'Years of Experience': experience,
-        'Location': location if location else "",  # Blank if no matching city found
+        'Location': location,
         'Filename': filename
     }
 
-def process_resumes(uploaded_files):
-    """Process multiple PDF files"""
-    data = []
-    for uploaded_file in uploaded_files:
-        text = extract_text_from_pdf(uploaded_file)
+def process_resume_batch(resume_batch):
+    """Process a batch of resumes in parallel"""
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        results = list(executor.map(process_single_resume, resume_batch))
+    return [r for r in results if r is not None]
+
+def process_single_resume(uploaded_file):
+    """Process a single resume file"""
+    try:
+        # Save to temp file to handle large files
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(uploaded_file.getbuffer())
+            tmp_path = tmp.name
+        
+        text = extract_text_from_pdf(tmp_path)
         if text:
             info = extract_contact_info(text, uploaded_file.name)
-            data.append(info)
-    return data
+            os.unlink(tmp_path)  # Clean up temp file
+            return info
+    except Exception as e:
+        st.error(f"Error processing {uploaded_file.name}: {str(e)}")
+    finally:
+        if 'tmp_path' in locals() and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+    return None
 
 def create_excel_download_link(df):
     """Generate a link to download the DataFrame as an Excel file"""
     output = BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df.to_excel(writer, index=False)
     excel_data = output.getvalue()
     return excel_data
 
 def main():
-    st.set_page_config(page_title="Basic Resume Parser", page_icon="📄", layout="wide")
+    st.set_page_config(
+        page_title="Large-Scale Resume Parser", 
+        page_icon="📄", 
+        layout="wide",
+        menu_items={
+            'About': "This application can process 500+ resumes (up to 10GB) efficiently."
+        }
+    )
     
-    st.title("📄 Basic Resume Parser")
+    st.title("📄 Large-Scale Resume Parser")
     st.markdown("""
-    Upload multiple resume PDFs to extract:
+    Upload **500+ resumes** (up to 10GB) to extract:
     - Name, Phone, Email
-    - Years of Experience
-    - Location (only if Hyderabad, Chennai, Bangalore, Pune, etc.)
+    - Location (Hyderabad, Chennai, Bangalore, etc.)
     """)
     
-    # File uploader
+    # File uploader with size limit
     uploaded_files = st.file_uploader(
         "Upload Resume PDFs", 
         type="pdf", 
         accept_multiple_files=True,
-        help="Select multiple PDF files containing resumes"
+        help=f"Select multiple PDF files (up to {MAX_FILE_SIZE/1024/1024/1024:.0f}GB total)"
     )
     
     if uploaded_files:
-        st.success(f"{len(uploaded_files)} file(s) uploaded successfully!")
+        total_size = sum(f.size for f in uploaded_files)
+        if total_size > MAX_FILE_SIZE:
+            st.error(f"Total size {total_size/1024/1024/1024:.2f}GB exceeds {MAX_FILE_SIZE/1024/1024/1024:.0f}GB limit")
+            return
+            
+        st.success(f"{len(uploaded_files)} files ({total_size/1024/1024:.2f}MB) uploaded successfully!")
         
-        # Process files when button is clicked
         if st.button("Process Resumes", type="primary"):
-            with st.spinner("Extracting information from resumes..."):
-                data = process_resumes(uploaded_files)
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            data = []
+            
+            # Process in chunks to manage memory
+            for i in range(0, len(uploaded_files), CHUNK_SIZE):
+                batch = uploaded_files[i:i + CHUNK_SIZE]
+                status_text.text(f"Processing files {i+1} to {min(i+CHUNK_SIZE, len(uploaded_files))}...")
                 
+                batch_results = process_resume_batch(batch)
+                data.extend(batch_results)
+                
+                progress = min((i + CHUNK_SIZE) / len(uploaded_files), 1.0)
+                progress_bar.progress(progress)
+            
             if data:
                 df = pd.DataFrame(data)
                 
-                # Display results
-                st.subheader("Extracted Data")
-                st.dataframe(df)
+                # Display summary
+                st.subheader(f"Processed {len(data)} resumes")
+                st.dataframe(df.head(100))  # Show first 100 rows
                 
-                # Download button
+                # Download options
                 st.subheader("Download Results")
                 excel_data = create_excel_download_link(df)
                 st.download_button(
@@ -135,10 +160,19 @@ def main():
                     data=excel_data,
                     file_name="resume_data.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    help="Click to download the extracted data as an Excel file"
+                    help="Click to download all extracted data"
                 )
+                
+                # Show stats
+                st.info(f"""
+                **Processing Complete**:
+                - Total resumes processed: {len(data)}
+                - With phone numbers: {len(df[df['Phone'] != ''])}
+                - With emails: {len(df[df['Email'] != ''])}
+                - With locations: {len(df[df['Location'] != ''])}
+                """)
             else:
-                st.warning("No information could be extracted from the uploaded files.")
+                st.warning("No valid data was extracted from the uploaded files.")
 
 if __name__ == "__main__":
     main()
